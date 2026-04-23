@@ -1,0 +1,10 @@
+.venv/
+.codex
+.codex/
+.locks/
+backups/
+logs/
+__pycache__/
+*.pyc
+models/*
+!models/tactical_rule_hybrid_agent_v6.pt
