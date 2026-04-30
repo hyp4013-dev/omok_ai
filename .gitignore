@@ -7,4 +7,7 @@ logs/
 __pycache__/
 *.pyc
 models/*
-!models/tactical_rule_hybrid_agent_v6.pt
+!models/value_agent_v203.pt
+!models/tactical_value_agent_v114.pt
+!models/tactical_rule_value_agent_v201.pt
+!models/tactical_rule_policy_agent_v14.pt
