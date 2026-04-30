@@ -83,6 +83,17 @@ class TorchPolicyAgent:
             raise ValueError("no valid actions available")
 
         board_tensor = self._board_tensor(env)
+        if training and env.move_count == 0:
+            opening_pool = self._central_opening_pool(valid_actions, env.board_size)
+            chosen_action = self.random.choice(opening_pool)
+            chosen_action_index = env.action_to_index(chosen_action)
+            log_prob = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+            return chosen_action, TorchPolicyStepRecord(
+                board_tensor=board_tensor,
+                chosen_action_index=chosen_action_index,
+                log_prob=log_prob,
+            )
+
         forced_action = find_forced_action(env)
         if forced_action is not None:
             chosen_action_index = env.action_to_index(forced_action)
@@ -115,6 +126,20 @@ class TorchPolicyAgent:
             chosen_action_index=chosen_action_index,
             log_prob=log_prob,
         )
+
+    def _central_opening_pool(
+        self,
+        valid_actions: list[tuple[int, int]],
+        board_size: int,
+    ) -> list[tuple[int, int]]:
+        opening_span = min(10, board_size)
+        opening_offset = (board_size - opening_span) // 2
+        opening_limit = opening_offset + opening_span - 1
+        return [
+            action
+            for action in valid_actions
+            if opening_offset <= action[0] <= opening_limit and opening_offset <= action[1] <= opening_limit
+        ]
 
     def finish_game(
         self,

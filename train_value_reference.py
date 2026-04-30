@@ -23,6 +23,9 @@ from agent.tactical_rule_agent import (
     TacticalRuleAgent,
 )
 from agent.torch_cnn_value_agent import TorchCNNValueAgent, TorchCNNValueStepRecord
+from agent.torch_hybrid_mix_agent import TorchHybridMixAgent
+from agent.torch_hybrid_agent import TorchHybridAgent
+from agent.torch_policy_only_agent import TorchPolicyOnlyAgent
 from agent.torch_value_agent import TorchValueAgent, TorchValueStepRecord
 from agent.value_agent import ValueAgent
 from env.gomoku_env import GomokuEnv
@@ -579,12 +582,25 @@ def _load_reference_agent(
     reference_rule_followup_probability: float = 0.1,
 ) -> Any:
     if reference_path.suffix == ".pt":
-        payload = torch.load(reference_path, map_location=device)
-        model_state = payload.get("model_state_dict", {})
-        if any(key.startswith("features.") or key.startswith("head.") for key in model_state):
-            base_agent = TorchCNNValueAgent.load(reference_path, name=reference_name, device=device)
+        try:
+            payload = torch.load(reference_path, map_location=device, weights_only=False)
+        except Exception:
+            base_agent = ValueAgent.load(reference_path, name=reference_name, seed=seed)
         else:
-            base_agent = TorchValueAgent.load(reference_path, name=reference_name, device=device)
+            if "value_model_state_dict" in payload and "policy_model_state_dict" in payload:
+                base_agent = TorchHybridMixAgent.load(reference_path, name=reference_name, device=device)
+            else:
+                model_state = payload.get("model_state_dict", {})
+                if any(key.startswith("policy_head.") or key.startswith("value_head.") for key in model_state):
+                    base_agent = TorchHybridAgent.load(reference_path, name=reference_name, device=device)
+                elif any(key.startswith("features.") or key.startswith("head.") for key in model_state):
+                    head_weight = model_state.get("head.3.weight")
+                    if head_weight is not None and head_weight.shape[0] > 1:
+                        base_agent = TorchPolicyOnlyAgent.load(reference_path, name=reference_name, device=device)
+                    else:
+                        base_agent = TorchCNNValueAgent.load(reference_path, name=reference_name, device=device)
+                else:
+                    base_agent = TorchValueAgent.load(reference_path, name=reference_name, device=device)
     else:
         base_agent = ValueAgent.load(reference_path, name=reference_name, seed=seed)
 
@@ -613,15 +629,9 @@ def _all_reference_paths(
     include_tactical_references: bool = False,
 ) -> list[Path]:
     reference_directory = _reference_directory(model_directory)
-    reference_candidates: list[tuple[str, int, Path]] = []
-    for path in reference_directory.glob("*_reference.pt"):
-        for prefix in ("value_agent", "tactical_value_agent", "tactical_rule_value_agent"):
-            version = _reference_version_from_path(path, prefix)
-            if version is not None:
-                reference_candidates.append((prefix, version, path))
-                break
+    reference_candidates = list(reference_directory.glob("*_reference.pt"))
     if reference_candidates:
-        return [path for _, _, path in sorted(reference_candidates, key=lambda item: (item[0], item[1]))]
+        return sorted(reference_candidates, key=_reference_sort_key)
     return [model_directory / "value_agent_v1.json"]
 
 
@@ -660,6 +670,13 @@ def _reference_version_from_path(path: Path, prefix: str) -> int | None:
     if suffix.isdigit():
         return int(suffix)
     return None
+
+
+def _reference_sort_components(path: Path) -> tuple[str, int, str]:
+    match = re.fullmatch(r"(?P<prefix>.+)_v(?P<version>\d+)_reference", path.stem)
+    if match is None:
+        return ("", 10**9, path.name)
+    return (match.group("prefix"), int(match.group("version")), path.name)
 
 
 def _reference_index_for_game(game_index: int, num_references: int, reference_cycle_length: int) -> int:
@@ -720,11 +737,8 @@ def _latest_reference_win_rates(log_directory: Path) -> dict[str, float]:
 
 
 def _reference_sort_key(path: Path) -> tuple[int, int, str]:
-    for prefix_order, prefix in enumerate(("value_agent", "tactical_value_agent")):
-        version = _reference_version_from_path(path, prefix)
-        if version is not None:
-            return (prefix_order, version, path.name)
-    return (10**9, 10**9, path.name)
+    prefix, version, name = _reference_sort_components(path)
+    return (0 if prefix.startswith("value_agent") else 1, version, name)
 
 
 def _historical_reference_lr_multiplier(reference_win_rate: float | None) -> float:
@@ -876,11 +890,9 @@ def _latest_reference_names(reference_paths: list[Path], count: int) -> list[str
     for path in reference_paths:
         name = _reference_name_from_path(path)
         fallback_names.append(name)
-        for prefix_order, prefix in enumerate(("value_agent", "tactical_value_agent")):
-            version = _reference_version_from_path(path, prefix)
-            if version is not None:
-                ordered_candidates.append((prefix_order, version, name))
-                break
+        prefix, version, _ = _reference_sort_components(path)
+        if version < 10**9:
+            ordered_candidates.append((0 if prefix.startswith("value_agent") else 1, version, name))
     if ordered_candidates:
         ordered_names = [
             name for _, _, name in sorted(ordered_candidates, key=lambda item: (item[0], item[1]))
@@ -913,6 +925,9 @@ def _reward_map(
 ) -> dict[str, float]:
     rewards = {reference_name: 0.0, candidate_name: 0.0}
     if winner == 0:
+        # Treat draws as a loss for training so prolonged neutral games are penalized.
+        rewards[candidate_name] = -1.0
+        rewards[reference_name] = 1.0
         return rewards
 
     winner_name = assignments[winner][0]
@@ -997,15 +1012,78 @@ def _append_reference_game_record(path: Path, record: dict, board_size: int) -> 
         selection_reason = move.get("selection_reason")
         reason_suffix = (
             f" [{selection_reason}]"
-            if selection_reason in {"random", "forced", "opening_random"}
+            if selection_reason in {"random", "forced", "opening_random", "teacher_forced"}
             else ""
         )
         lines.append(
             f"  {move_index:>3}. {player_name} ({move['agent']}) -> (row={row}, col={col}){reason_suffix}"
         )
+    metrics = record.get("metrics")
+    if metrics:
+        lines.append(_format_reference_game_metrics(metrics))
     lines.append("")
     with path.open("a", encoding="utf-8") as log_file:
         log_file.write("\n".join(lines) + "\n")
+
+
+def _format_reference_game_metrics(metrics: dict[str, object]) -> str:
+    def _fmt_float(value: object, precision: int = 4) -> str:
+        if isinstance(value, (int, float)):
+            return f"{float(value):.{precision}f}"
+        return "n/a"
+
+    def _fmt_ratio(correct: object, total: object) -> str:
+        if not isinstance(correct, (int, float)) or not isinstance(total, (int, float)):
+            return "n/a"
+        total_int = int(total)
+        if total_int <= 0:
+            return "n/a"
+        correct_int = int(correct)
+        return f"{correct_int}/{total_int} ({correct_int / total_int:.2%})"
+
+    selection_counts = metrics.get("selection_counts")
+    mode_parts: list[str] = []
+    if isinstance(selection_counts, dict):
+        for key in ("opening_random", "random", "policy_sample", "policy_greedy", "forced", "teacher_forced"):
+            if key in selection_counts:
+                mode_parts.append(f"{key}:{int(selection_counts[key])}")
+
+    parts = [
+        f"Metrics: policy_loss={_fmt_float(metrics.get('policy_loss'))}",
+        f"policy_loss_max={_fmt_float(metrics.get('policy_loss_max'))}",
+        f"aux_loss={_fmt_float(metrics.get('teacher_aux_loss'))}",
+        f"aux_loss_max={_fmt_float(metrics.get('teacher_aux_loss_max'))}",
+        f"total_loss={_fmt_float(metrics.get('total_loss'))}",
+        f"entropy={_fmt_float(metrics.get('policy_entropy'))}",
+        f"teacher_top1={_fmt_ratio(metrics.get('teacher_top1_correct'), metrics.get('teacher_eval_steps'))}",
+        f"teacher_top3={_fmt_ratio(metrics.get('teacher_top3_correct'), metrics.get('teacher_eval_steps'))}",
+        f"teacher_top5={_fmt_ratio(metrics.get('teacher_top5_correct'), metrics.get('teacher_eval_steps'))}",
+    ]
+    debug_steps = metrics.get("debug_eval_steps")
+    if isinstance(debug_steps, (int, float)) and int(debug_steps) > 0:
+        debug_finite_steps = metrics.get("debug_finite_steps")
+        parts.append(
+            "dbg="
+            + ",".join(
+                [
+                    f"target_logit_avg={_fmt_float(metrics.get('debug_target_logit_avg'))}",
+                    f"target_logit_min={_fmt_float(metrics.get('debug_target_logit_min'))}",
+                    f"max_logit_avg={_fmt_float(metrics.get('debug_max_logit_avg'))}",
+                    f"logit_gap_avg={_fmt_float(metrics.get('debug_logit_gap_avg'))}",
+                    f"logit_gap_max={_fmt_float(metrics.get('debug_logit_gap_max'))}",
+                    f"target_prob_avg={_fmt_float(metrics.get('debug_target_prob_avg'))}",
+                    f"max_prob_avg={_fmt_float(metrics.get('debug_max_prob_avg'))}",
+                    f"target_rank_avg={_fmt_float(metrics.get('debug_target_rank_avg'), precision=2)}",
+                    f"valid_avg={_fmt_float(metrics.get('debug_valid_action_count_avg'), precision=2)}",
+                    f"finite={_fmt_ratio(debug_finite_steps, debug_steps)}",
+                ]
+            )
+        )
+    if mode_parts:
+        parts.append(f"modes={', '.join(mode_parts)}")
+    if metrics.get("effective_learning_rate") is not None:
+        parts.append(f"lr={_fmt_float(metrics.get('effective_learning_rate'), precision=6)}")
+    return ", ".join(parts)
 
 
 def _append_reference_summary(
@@ -1260,6 +1338,7 @@ def _write_reference_winrate_log(
     candidate_role_counts: Counter[tuple[str, str]] | None = None,
     reference_role_counts: Counter[tuple[str, str, str]] | None = None,
 ) -> None:
+    reference_names = sorted(reference_names)
     total_reference_games = sum(int(reference_game_counts.get(reference_name, 0)) for reference_name in reference_names)
     candidate_wins = summary_counter[candidate_name]
     reference_wins = sum(summary_counter[reference_name] for reference_name in reference_names)

@@ -90,6 +90,16 @@ class TorchCNNValueAgent:
         if not valid_actions:
             raise ValueError("no valid actions available")
 
+        if training and env.move_count == 0:
+            opening_pool = self._central_opening_pool(valid_actions, env.board_size)
+            chosen_action = self.random.choice(opening_pool)
+            chosen_index = valid_actions.index(chosen_action)
+            board_tensor = self._board_tensor_after_action(env, chosen_action)
+            return chosen_action, TorchCNNValueStepRecord(
+                board_tensor=board_tensor,
+                selection_reason="opening_random",
+            )
+
         forced_action = find_forced_action(env)
         if forced_action is not None:
             board_tensor = self._board_tensor_after_action(env, forced_action)
@@ -100,15 +110,6 @@ class TorchCNNValueAgent:
 
         board_tensors = [self._board_tensor_after_action(env, action) for action in valid_actions]
         scores = self._predict_scores(board_tensors)
-        if training and env.move_count == 0:
-            opening_pool = self._central_opening_pool(valid_actions, env.board_size)
-            chosen_action = self.random.choice(opening_pool)
-            chosen_index = valid_actions.index(chosen_action)
-            return chosen_action, TorchCNNValueStepRecord(
-                board_tensor=board_tensors[chosen_index],
-                selection_reason="opening_random",
-            )
-
         allow_random_exploration = env.move_count >= self.quick_win_move_threshold
         if training and allow_random_exploration and self.random.random() < self.epsilon:
             ranked_indices = sorted(range(len(valid_actions)), key=lambda index: scores[index], reverse=True)

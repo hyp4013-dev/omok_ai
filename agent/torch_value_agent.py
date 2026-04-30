@@ -73,6 +73,13 @@ class TorchValueAgent:
         if not valid_actions:
             raise ValueError("no valid actions available")
 
+        if training and env.move_count == 0:
+            opening_pool = self._central_opening_pool(valid_actions, env.board_size)
+            chosen_action = self.random.choice(opening_pool)
+            return chosen_action, TorchValueStepRecord(
+                features=action_features(env.board, env.current_player, chosen_action)
+            )
+
         forced_action = find_forced_action(env)
         if forced_action is not None:
             return forced_action, TorchValueStepRecord(

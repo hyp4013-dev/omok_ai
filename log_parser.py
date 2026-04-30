@@ -13,6 +13,7 @@ COMPETITIVE_HEADER = "Gomoku Competitive Training Log"
 VALUE_REFERENCE_HEADER = "Gomoku Value Reference Training Log"
 TACTICAL_VALUE_REFERENCE_HEADER = "Gomoku Tactical Value Reference Training Log"
 TACTICAL_RULE_VALUE_REFERENCE_HEADER = "Gomoku Tactical Rule Value Reference Training Log"
+TACTICAL_RULE_POLICY_REFERENCE_HEADER = "Gomoku Tactical Policy Reference Training Log"
 TACTICAL_VALUE_TRAINING_HEADER = "Gomoku Tactical Value Training Log"
 TACTICAL_RULE_VALUE_TRAINING_HEADER = "Gomoku Tactical Rule Value Training Log"
 
@@ -45,6 +46,7 @@ MOVE_RE = re.compile(
     r"^\s*(?P<move_number>\d+)\. (?P<player>Black|White)(?: \((?P<agent_name>[^)]+)\))? -> "
     r"\(row=(?P<row>\d+), col=(?P<col>\d+)\)(?: \[(?P<selection_reason>[^\]]+)\])?$"
 )
+METRICS_RE = re.compile(r"^Metrics: ")
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,7 @@ def parse_log_text(text: str) -> SimulationLog:
         VALUE_REFERENCE_HEADER,
         TACTICAL_VALUE_REFERENCE_HEADER,
         TACTICAL_RULE_VALUE_REFERENCE_HEADER,
+        TACTICAL_RULE_POLICY_REFERENCE_HEADER,
     }
     tactical_headers = {
         TACTICAL_VALUE_TRAINING_HEADER,
@@ -401,6 +404,9 @@ def _parse_games(lines: list[str], log_type: str) -> list[GameRecord]:
             if not lines[index].strip():
                 index += 1
                 break
+            if METRICS_RE.match(lines[index]):
+                index += 1
+                continue
             move_match = MOVE_RE.match(lines[index])
             if not move_match:
                 if index == len(lines) - 1 or lines[index].startswith("Summary"):

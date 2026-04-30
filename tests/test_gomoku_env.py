@@ -19,7 +19,9 @@ from agent.tactical_rule_agent import (
     build_random_hard_tactical_rule_agent,
 )
 from agent.torch_cnn_value_agent import TorchCNNValueAgent
+from agent.torch_hybrid_mix_agent import TorchHybridMixAgent
 from agent.torch_hybrid_agent import TorchHybridAgent
+from agent.torch_policy_only_agent import TorchPolicyOnlyAgent
 from agent.torch_value_agent import TorchValueAgent
 from agent.value_agent import ValueAgent
 from env.gomoku_env import GomokuEnv
@@ -27,7 +29,11 @@ from log_parser import build_board_state, parse_log_file, parse_log_text
 from log_utils import find_latest_log
 from play_random import simulate_game, simulate_games
 from train_competitive import train_competitive, train_until_balanced
+from train_hybrid_mix_reference import train_against_reference as train_hybrid_mix_against_reference
 from train_hybrid_reference import train_against_reference as train_hybrid_against_reference
+from train_policy_only_reference import train_against_reference as train_policy_only_against_reference
+from train_policy_only_reference import _reference_overlay_level_for_path
+from train_policy_only_reference import _reward_map as _policy_reward_map
 from train_value_reference import (
     _all_reference_paths,
     _default_reference_paths,
@@ -40,9 +46,11 @@ from train_value_reference import (
     _latest_reference_win_rates,
     _reference_index_for_game,
     _reference_directory,
+    _write_reference_winrate_log,
     _scheduled_reference_game_counts,
     train_against_reference,
     train_with_progressive_references,
+    _reward_map as _value_reward_map,
 )
 from utils.state_encoder import action_features
 from utils.tactical_rules import find_forced_action
@@ -137,6 +145,20 @@ class GomokuEnvTest(unittest.TestCase):
         self.assertEqual(info["winner"], 0)
         self.assertEqual(env.get_valid_actions(), [])
 
+    def test_draw_is_treated_as_loss_in_reward_map(self) -> None:
+        assignments = {
+            1: ("reference", object()),
+            -1: ("candidate", object()),
+        }
+
+        policy_rewards = _policy_reward_map(0, assignments, "reference", "candidate")
+        value_rewards = _value_reward_map(0, assignments, "reference", "candidate")
+
+        self.assertEqual(policy_rewards["reference"], 1.0)
+        self.assertEqual(policy_rewards["candidate"], -1.0)
+        self.assertEqual(value_rewards["reference"], 1.0)
+        self.assertEqual(value_rewards["candidate"], -1.0)
+
     def test_cannot_step_after_game_ends(self) -> None:
         env = GomokuEnv(board_size=5)
 
@@ -190,6 +212,39 @@ class GomokuEnvTest(unittest.TestCase):
         self.assertEqual(len(parsed.games), 2)
         self.assertEqual(parsed.games[0].board_size, 5)
         self.assertEqual(parsed.games[0].moves, len(parsed.games[0].move_history))
+
+    def test_log_parser_ignores_policy_metrics_line(self) -> None:
+        log_text = "\n".join(
+            [
+                "Gomoku Tactical Policy Reference Training Log",
+                "Generated at: 2026-04-30 12:00:00",
+                "Board size: 15x15",
+                "Reference init model: models/refer/value_agent_v203_reference.pt",
+                "Candidate model: models/tactical_rule_policy_agent_v1.pt",
+                "Candidate init model: models/tactical_rule_policy_agent_v0.pt",
+                "Candidate feature init model: none",
+                "Reference rule level: super_easy",
+                "Reference rule overlay exclusion prefixes: tactical_rule_value_agent",
+                "Candidate black priority: False",
+                "Reference rule opening moves: 20",
+                "Reference rule followup probability: 0.100",
+                "Teacher rule agent: hard",
+                "Teacher weight: 1.000",
+                "Opening teacher moves: 20",
+                "Game 1: winner=test_reference, moves=1, board=15x15, reference_role=black, candidate_role=white, candidate_reward=-1.0, candidate_epsilon=0.0000",
+                "Move record",
+                "  1. Black (test_reference) -> (row=0, col=0)",
+                "Metrics: policy_loss=0.1000, aux_loss=0.0100, total_loss=0.1100, entropy=1.2345, teacher_top1=1/1 (100.00%), teacher_top3=1/1 (100.00%), teacher_top5=1/1 (100.00%), modes=policy_greedy:1, lr=0.000200",
+                "",
+            ]
+        )
+
+        parsed = parse_log_text(log_text)
+
+        self.assertEqual(parsed.summary.total_games, 1)
+        self.assertEqual(len(parsed.games), 1)
+        self.assertEqual(parsed.games[0].moves, 1)
+        self.assertEqual(parsed.games[0].move_history[0].agent_name, "test_reference")
 
     def test_build_board_state_replays_moves(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -303,6 +358,26 @@ class GomokuEnvTest(unittest.TestCase):
             action, _ = agent.select_action(env, training=False)
 
         self.assertEqual(action, (0, 0))
+
+    def test_torch_hybrid_mix_agent_lets_policy_break_ties_with_small_mix_weight(self) -> None:
+        env = GomokuEnv(board_size=5)
+        agent = TorchHybridMixAgent(name="mix", board_size=5, seed=7, policy_mix_weight=0.01)
+
+        value_scores = torch.zeros(25, dtype=torch.float32)
+        value_scores[0] = 0.001
+
+        def fake_policy_forward(x):
+            logits = torch.zeros((x.shape[0], 25), dtype=torch.float32)
+            logits[:, 24] = 10.0
+            return logits
+
+        with patch.object(agent, "_action_value_scores", return_value=value_scores), patch.object(
+            agent.policy_model, "forward", side_effect=fake_policy_forward
+        ):
+            action, record = agent.select_action(env, training=False)
+
+        self.assertEqual(record.selection_reason, "mixed_selection")
+        self.assertEqual(action, (4, 4))
 
     def test_torch_hybrid_agent_learns_policy_head_separately(self) -> None:
         env = GomokuEnv(board_size=5)
@@ -767,6 +842,48 @@ class GomokuEnvTest(unittest.TestCase):
         self.assertEqual(parsed.summary.candidate_label, "tactical_value_agent_v7")
         self.assertEqual(parsed.summary.candidate_wins, 1)
 
+    def test_log_parser_accepts_tactical_policy_reference_header(self) -> None:
+        parsed = parse_log_text(
+            "\n".join(
+                [
+                    "Gomoku Tactical Policy Reference Training Log",
+                    "Generated at: 2026-04-28 08:37:46",
+                    "Board size: 15x15",
+                    "Candidate model: models/tactical_rule_policy_agent_v73.pt",
+                    "Candidate init model: models/tactical_rule_policy_agent_v72.pt",
+                    "Candidate feature init model: none",
+                    "Reference init model: models/refer/tactical_value_agent_v201_reference.pt",
+                    "Reference rule level: none",
+                    "Candidate black priority: False",
+                    "Reference rule opening moves: 20",
+                    "Reference rule followup probability: 0.100",
+                    "Teacher rule agent: hard",
+                    "Teacher weight: 1.000",
+                    "Opening teacher moves: 20",
+                    "",
+                    "Game 1: winner=tactical_rule_policy_agent_v73, moves=2, board=15x15, reference_role=black, candidate_role=white, candidate_reward=1.0, candidate_epsilon=0.0200",
+                    "Move record",
+                    "    1. Black (tactical_value_agent_v201_reference) -> (row=7, col=7)",
+                    "    2. White (tactical_rule_policy_agent_v73) -> (row=7, col=8)",
+                    "",
+                    "Summary",
+                    "",
+                    "- Total games: 1",
+                    "- Reference ensemble wins: 0",
+                    "- tactical_rule_policy_agent_v73 wins: 1",
+                    "- Draws: 0",
+                ]
+            )
+        )
+
+        self.assertEqual(parsed.log_type, "value_reference")
+        self.assertEqual(parsed.summary.total_games, 1)
+        self.assertEqual(parsed.summary.candidate_label, "tactical_rule_policy_agent_v73")
+        self.assertEqual(parsed.summary.candidate_wins, 1)
+        self.assertEqual(parsed.summary.reference_wins, 0)
+        self.assertEqual(parsed.games[0].black_agent, "tactical_value_agent_v201_reference")
+        self.assertEqual(parsed.games[0].white_agent, "tactical_rule_policy_agent_v73")
+
     def test_torch_value_agent_save_and_load(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "torch_value.pt"
@@ -917,6 +1034,39 @@ class GomokuEnvTest(unittest.TestCase):
             self.assertTrue(promoted_reference.exists())
             self.assertIn("Gomoku Hybrid Reference Training Log", log_content)
 
+    def test_hybrid_mix_reference_training_saves_outputs_and_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "models"
+            log_dir = Path(temp_dir) / "logs"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            reference_path = model_dir / "value_agent_v20_reference.pt"
+            TorchCNNValueAgent(name="value_agent_v20", board_size=15, seed=20).save(reference_path)
+
+            result = train_hybrid_mix_against_reference(
+                num_games=1,
+                board_size=15,
+                save_every=1,
+                seed=9,
+                log_dir=log_dir,
+                model_dir=model_dir,
+                reference_model_path=[reference_path],
+                candidate_version=1,
+                candidate_prefix="tactical_rule_hybrid_mix_weight_agent",
+            )
+
+            training_log = Path(result["training_log_path"])
+            candidate_model = Path(result["candidate_model_path"])
+            promoted_reference = Path(result["promoted_reference_path"])
+            log_content = training_log.read_text(encoding="utf-8")
+
+            self.assertTrue(training_log.exists())
+            self.assertTrue(candidate_model.exists())
+            self.assertTrue(promoted_reference.exists())
+            self.assertIn("Gomoku Hybrid Mix Reference Training Log", log_content)
+            self.assertIn("Policy decision mix weight: 0.010", log_content)
+
     def test_torch_hybrid_agent_bootstraps_from_value_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             value_model_path = Path(temp_dir) / "value_agent_v20.pt"
@@ -927,6 +1077,223 @@ class GomokuEnvTest(unittest.TestCase):
 
         self.assertIsInstance(hybrid_agent, TorchHybridAgent)
         self.assertEqual(hybrid_agent.name, "hybrid")
+
+    def test_torch_policy_only_agent_bootstraps_from_value_checkpoint(self) -> None:
+        value_model_path = Path("/home/yphong/omok_deeplearning/models/tactical_rule_value_agent_v201.pt")
+        self.assertTrue(value_model_path.exists())
+
+        policy_agent = TorchPolicyOnlyAgent.load_from_value_checkpoint(
+            value_model_path,
+            name="policy_only",
+            device="cpu",
+        )
+
+        self.assertEqual(policy_agent.name, "policy_only")
+        self.assertEqual(policy_agent.board_size, 15)
+        payload = torch.load(value_model_path, map_location="cpu")
+        value_state = payload["model_state_dict"]
+        policy_state = policy_agent.model.state_dict()
+        self.assertTrue(torch.equal(policy_state["features.0.weight"], value_state["features.0.weight"]))
+        self.assertTrue(torch.equal(policy_state["features.2.weight"], value_state["features.2.weight"]))
+        self.assertTrue(torch.equal(policy_state["head.1.weight"], value_state["head.1.weight"]))
+
+    def test_torch_policy_only_agent_bootstraps_features_from_hybrid_checkpoint(self) -> None:
+        hybrid_model_path = Path("/home/yphong/omok_deeplearning/models/tactical_rule_hybrid_agent_v37.pt")
+        self.assertTrue(hybrid_model_path.exists())
+
+        policy_agent = TorchPolicyOnlyAgent.load_with_feature_checkpoint(
+            hybrid_model_path,
+            name="policy_only",
+            device="cpu",
+        )
+
+        payload = torch.load(hybrid_model_path, map_location="cpu")
+        policy_state = policy_agent.model.state_dict()
+        hybrid_policy_state = payload["policy_model_state_dict"]
+
+        self.assertTrue(torch.equal(policy_state["features.0.weight"], hybrid_policy_state["features.0.weight"]))
+        self.assertTrue(torch.equal(policy_state["features.2.weight"], hybrid_policy_state["features.2.weight"]))
+        self.assertTrue(torch.equal(policy_state["features.4.weight"], hybrid_policy_state["features.4.weight"]))
+        self.assertNotEqual(policy_state["head.1.weight"].shape, hybrid_policy_state["head.1.weight"].shape)
+
+    def test_torch_policy_only_agent_builds_teacher_forced_record(self) -> None:
+        env = GomokuEnv(board_size=15)
+        agent = TorchPolicyOnlyAgent.create_blank(name="policy_only", board_size=15, seed=7)
+        teacher_action = (7, 7)
+
+        teacher_index = env.action_to_index(teacher_action)
+
+        def fake_forward(x):
+            logits = torch.zeros((x.shape[0], 225), dtype=torch.float32)
+            logits[:, teacher_index] = 10.0
+            logits[:, teacher_index - 1] = 9.0
+            logits[:, teacher_index + 1] = 8.0
+            logits[:, teacher_index + 2] = 7.0
+            logits[:, teacher_index + 3] = 6.0
+            return logits
+
+        with patch.object(agent.model, "forward", side_effect=fake_forward):
+            record = agent.build_teacher_forced_record(env, teacher_action)
+
+        self.assertEqual(record.selection_reason, "teacher_forced")
+        self.assertIsNone(record.log_prob)
+        self.assertEqual(record.teacher_action_index, teacher_index)
+        self.assertEqual(
+            record.chosen_action_index,
+            record.valid_action_indices.index(teacher_index),
+        )
+        self.assertIsNotNone(record.policy_entropy)
+        self.assertTrue(record.policy_top1_correct)
+        self.assertTrue(record.policy_top3_correct)
+        self.assertTrue(record.policy_top5_correct)
+
+    def test_torch_policy_only_agent_randomizes_opening_within_central_ten_by_ten(self) -> None:
+        env = GomokuEnv(board_size=15)
+        agent = TorchPolicyOnlyAgent(name="policy_only", board_size=15, seed=7)
+        valid_actions = env.get_valid_actions()
+        captured_pool: list[tuple[int, int]] = []
+        expected_pool = {
+            (row, col)
+            for row in range(2, 12)
+            for col in range(2, 12)
+        }
+
+        def choose(pool):
+            captured_pool[:] = list(pool)
+            return pool[0]
+
+        with patch.object(agent.random, "choice", side_effect=choose), patch(
+            "agent.torch_policy_only_agent.find_forced_action", return_value=(0, 0)
+        ):
+            action, record = agent.select_action(env, training=True)
+
+        self.assertEqual(record.selection_reason, "opening_random")
+        self.assertEqual(len(captured_pool), 100)
+        self.assertTrue(set(captured_pool).issubset(expected_pool))
+        self.assertIn(action, expected_pool)
+
+    def test_torch_policy_only_agent_uses_greedy_selection_when_not_training(self) -> None:
+        env = GomokuEnv(board_size=5)
+        agent = TorchPolicyOnlyAgent(name="policy_only", board_size=5, seed=7, epsilon_start=0.0)
+
+        def fake_forward(x):
+            logits = torch.zeros((x.shape[0], 25), dtype=torch.float32)
+            logits[:, 24] = 10.0
+            return logits
+
+        with patch.object(agent.model, "forward", side_effect=fake_forward):
+            action, record = agent.select_action(env, training=False)
+
+        self.assertEqual(record.selection_reason, "policy_greedy")
+        self.assertEqual(action, (4, 4))
+
+    def test_torch_policy_only_agent_switches_to_greedy_late_in_training(self) -> None:
+        env = GomokuEnv(board_size=7)
+        agent = TorchPolicyOnlyAgent(name="policy_only", board_size=7, seed=7, epsilon_start=0.0)
+        agent.greedy_move_threshold = 30
+        env.move_count = 30
+        env.current_player = 1
+        env.done = False
+
+        def fake_forward(x):
+            logits = torch.zeros((x.shape[0], 49), dtype=torch.float32)
+            logits[:, 48] = 10.0
+            return logits
+
+        with patch.object(agent.model, "forward", side_effect=fake_forward):
+            action, record = agent.select_action(env, training=True)
+
+        self.assertEqual(record.selection_reason, "policy_greedy")
+        self.assertEqual(action, (6, 6))
+
+    def test_tactical_rule_agent_randomizes_opening_before_forced_action(self) -> None:
+        env = GomokuEnv(board_size=15)
+        agent = TacticalRuleAgent(seed=7)
+        captured_pool: list[tuple[int, int]] = []
+        expected_pool = {
+            (row, col)
+            for row in range(2, 12)
+            for col in range(2, 12)
+        }
+
+        def choose(pool):
+            captured_pool[:] = list(pool)
+            return pool[0]
+
+        with patch.object(agent.random, "choice", side_effect=choose), patch(
+            "agent.tactical_rule_agent.find_forced_action", return_value=(0, 0)
+        ):
+            action, evaluation = agent.select_action(env)
+
+        self.assertEqual(evaluation.action, action)
+        self.assertEqual(len(captured_pool), 100)
+        self.assertTrue(set(captured_pool).issubset(expected_pool))
+        self.assertIn(action, expected_pool)
+
+    def test_policy_only_reference_training_saves_outputs_and_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "models"
+            log_dir = Path(temp_dir) / "logs"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            result = train_policy_only_against_reference(
+                num_games=1,
+                board_size=15,
+                save_every=1,
+                seed=9,
+                log_dir=log_dir,
+                model_dir=model_dir,
+                candidate_feature_init_model_path=Path("/home/yphong/omok_deeplearning/models/tactical_rule_hybrid_agent_v37.pt"),
+                reference_model_path=Path("/home/yphong/omok_deeplearning/models/refer/value_agent_v203_reference.pt"),
+                candidate_version=1,
+                candidate_prefix="tactical_rule_policy_agent",
+                reference_rule_agent_level="none",
+                reference_rule_opening_moves=20,
+                reference_rule_followup_probability=0.1,
+                teacher_rule_agent_level="hard",
+                teacher_weight=1.0,
+                opening_teacher_moves=20,
+            )
+
+            training_log = Path(result["training_log_path"])
+            candidate_model = Path(result["candidate_model_path"])
+            promoted_reference = Path(result["promoted_reference_path"])
+            log_content = training_log.read_text(encoding="utf-8")
+
+            self.assertTrue(training_log.exists())
+            self.assertTrue(candidate_model.exists())
+            self.assertTrue(promoted_reference.exists())
+            self.assertIn("Gomoku Tactical Policy Reference Training Log", log_content)
+            self.assertIn("Candidate init model: random", log_content)
+            self.assertIn("Candidate feature init model: /home/yphong/omok_deeplearning/models/tactical_rule_hybrid_agent_v37.pt", log_content)
+            self.assertIn("Opening teacher moves: 20", log_content)
+            self.assertIn("Reference init model: /home/yphong/omok_deeplearning/models/refer/value_agent_v203_reference.pt", log_content)
+            self.assertIn("Reference rule level: none", log_content)
+            self.assertIn("Teacher rule agent: hard", log_content)
+            self.assertIn("[teacher_forced]", log_content)
+            self.assertIn("Metrics:", log_content)
+            self.assertIn("teacher_top1=", log_content)
+            self.assertIn("entropy=", log_content)
+            self.assertIn("dbg=", log_content)
+            self.assertIn("target_logit_avg=", log_content)
+
+    def test_policy_only_reference_excludes_rule_value_models_from_overlay(self) -> None:
+        self.assertIsNone(
+            _reference_overlay_level_for_path(
+                Path("models/refer/tactical_rule_value_agent_v36_reference.pt"),
+                base_overlay_level="super_easy",
+                exclusion_prefixes=("tactical_rule_value_agent",),
+            )
+        )
+        self.assertEqual(
+            _reference_overlay_level_for_path(
+                Path("models/refer/tactical_rule_policy_agent_v74_reference.pt"),
+                base_overlay_level="super_easy",
+                exclusion_prefixes=("tactical_rule_value_agent",),
+            ),
+            "super_easy",
+        )
 
     def test_rule_augmented_reference_agent_can_fall_back_to_rule_after_opening(self) -> None:
         rule_agent = HardTacticalRuleAgent()
@@ -1006,6 +1373,7 @@ class GomokuEnvTest(unittest.TestCase):
             reference_dir = _reference_directory(model_dir)
             for version in (3, 20, 21, 22, 23):
                 (reference_dir / f"value_agent_v{version}_reference.pt").write_bytes(b"test")
+            (reference_dir / "tactical_rule_policy_agent_v4_reference.pt").write_bytes(b"test")
 
             selected = _default_reference_paths(model_dir, log_directory=log_dir)
 
@@ -1017,6 +1385,7 @@ class GomokuEnvTest(unittest.TestCase):
                 "value_agent_v21_reference.pt",
                 "value_agent_v22_reference.pt",
                 "value_agent_v23_reference.pt",
+                "tactical_rule_policy_agent_v4_reference.pt",
             ],
         )
 
@@ -1093,6 +1462,43 @@ class GomokuEnvTest(unittest.TestCase):
         self.assertEqual(rates["value_agent_v45_reference"], 0.75)
         self.assertEqual(rates["value_agent_v46_reference"], 0.50)
         self.assertEqual(rates["value_agent_v47_reference"], 0.95)
+
+    def test_write_reference_winrate_log_sorts_names_alphabetically(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "winrates.log"
+            _write_reference_winrate_log(
+                path=path,
+                candidate_name="candidate",
+                candidate_version=1,
+                training_log_path=Path("logs/example.log"),
+                reference_names=[
+                    "tactical_rule_policy_agent_v8_reference",
+                    "value_agent_v203_reference",
+                    "tactical_value_agent_v114_reference",
+                ],
+                reference_game_counts={
+                    "tactical_rule_policy_agent_v8_reference": 1,
+                    "value_agent_v203_reference": 1,
+                    "tactical_value_agent_v114_reference": 1,
+                },
+                summary_counter={
+                    "candidate": 0,
+                    "tactical_rule_policy_agent_v8_reference": 0,
+                    "value_agent_v203_reference": 0,
+                    "tactical_value_agent_v114_reference": 0,
+                    "draw": 0,
+                },
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertLess(
+            content.index("- tactical_rule_policy_agent_v8_reference:"),
+            content.index("- tactical_value_agent_v114_reference:"),
+        )
+        self.assertLess(
+            content.index("- tactical_value_agent_v114_reference:"),
+            content.index("- value_agent_v203_reference:"),
+        )
 
     def test_filter_reference_paths_excludes_overfit_references(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1382,8 +1788,8 @@ class GomokuEnvTest(unittest.TestCase):
 
     def test_find_latest_log_returns_most_recent_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            older = Path(temp_dir) / "20260406_140000.log"
-            newer = Path(temp_dir) / "20260406_150000.log"
+            older = Path(temp_dir) / "20260406_140000_value_reference_training.log"
+            newer = Path(temp_dir) / "20260406_150000_value_reference_training.log"
             older.write_text("old", encoding="utf-8")
             newer.write_text("new", encoding="utf-8")
 

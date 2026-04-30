@@ -67,6 +67,12 @@ class ValueAgent:
         if not valid_actions:
             raise ValueError("no valid actions available")
 
+        if training and env.move_count == 0:
+            opening_pool = self._central_opening_pool(valid_actions, env.board_size)
+            action = self.random.choice(opening_pool)
+            features = action_features(env.board, env.current_player, action)
+            return action, ValueStepRecord(features=features, prediction=self._predict(features))
+
         forced_action = find_forced_action(env)
         if forced_action is not None:
             features = action_features(env.board, env.current_player, forced_action)

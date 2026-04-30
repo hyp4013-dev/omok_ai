@@ -34,12 +34,21 @@ for path in models.glob("tactical_rule_value_agent_v*.pt"):
         continue
     if (reference_directory / f"{path.stem}_reference.pt").exists():
         versions.append(version)
-print(max(versions) if versions else 9)
+print(max(versions) if versions else 14)
 PY
   )
 
   next_version=$((latest_version + 1))
   candidate_init="models/tactical_rule_value_agent_v${latest_version}.pt"
+  candidate_init_args=()
+  if [ -f "$candidate_init" ]; then
+    candidate_init_args=(--candidate-init-model "$candidate_init")
+  else
+    candidate_init=""
+  fi
+
+  run_start_marker="$(mktemp "$ROOT/.locks/tactical_rule_value_reference_start.XXXXXX")"
+  touch "$run_start_marker"
 
   "$PYTHON" train_value_reference.py \
     --games 1000 \
@@ -47,7 +56,6 @@ PY
     --pretrain-positions 0 \
     --candidate-prefix tactical_rule_value_agent \
     --candidate-version "$next_version" \
-    --candidate-init-model "$candidate_init" \
     --reference-cycle-length 10 \
     --reference-rule-agent-level hard \
     --reference-rule-opening-moves 20 \
@@ -55,7 +63,30 @@ PY
     --reference-rule-only-agent-level hard \
     --teacher-rule-agent-level hard \
     --teacher-weight 1.0 \
-    --device cpu
+    --device cpu \
+    "${candidate_init_args[@]}" &
+  train_pid=$!
+
+  initial_log=""
+  for _ in $(seq 1 120); do
+    initial_log=$(
+      find logs -maxdepth 1 -type f -name '*_tactical_rule_value_reference_training.log' -newer "$run_start_marker" \
+        | sort \
+        | tail -n 1
+    )
+    if [ -n "$initial_log" ]; then
+      break
+    fi
+    sleep 1
+  done
+  rm -f "$run_start_marker"
+
+  if [ -n "$initial_log" ]; then
+    echo "[monitor] initial log: $initial_log"
+    sed -n '1,20p' "$initial_log"
+  fi
+
+  wait "$train_pid"
 
   sleep 5
 done

@@ -66,6 +66,11 @@ class TacticalRuleAgent:
         if not valid_actions:
             raise ValueError("no valid actions available")
 
+        if env.move_count == 0:
+            opening_pool = self._central_opening_pool(valid_actions, env.board_size)
+            chosen_action = self.random.choice(opening_pool)
+            return chosen_action, TacticalRuleEvaluation(action=chosen_action, score=float("inf"))
+
         forced_action = find_forced_action(env, include_open_three_block=self.include_open_three_block)
         if forced_action is not None:
             return forced_action, TacticalRuleEvaluation(action=forced_action, score=float("inf"))
@@ -230,6 +235,20 @@ class TacticalRuleAgent:
                     if env.board[next_row][next_col] != 0:
                         bonus += 2.5
         return bonus
+
+    def _central_opening_pool(
+        self,
+        valid_actions: list[Action],
+        board_size: int,
+    ) -> list[Action]:
+        opening_span = min(10, board_size)
+        opening_offset = (board_size - opening_span) // 2
+        opening_limit = opening_offset + opening_span - 1
+        return [
+            action
+            for action in valid_actions
+            if opening_offset <= action[0] <= opening_limit and opening_offset <= action[1] <= opening_limit
+        ]
 
 
 class EasyTacticalRuleAgent(TacticalRuleAgent):

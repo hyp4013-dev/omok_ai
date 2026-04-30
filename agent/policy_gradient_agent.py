@@ -62,6 +62,17 @@ class PolicyGradientAgent:
         valid_action_features = [
             action_features(env.board, env.current_player, action) for action in valid_actions
         ]
+        if training and env.move_count == 0:
+            opening_pool = self._central_opening_pool(valid_actions, env.board_size)
+            chosen_action = self.random.choice(opening_pool)
+            chosen_index = valid_actions.index(chosen_action)
+            return valid_actions[chosen_index], PolicyStepRecord(
+                state_features=state_features,
+                action_features=valid_action_features[chosen_index],
+                valid_action_features=valid_action_features,
+                chosen_index=chosen_index,
+            )
+
         forced_action = find_forced_action(env)
         if forced_action is not None:
             chosen_index = valid_actions.index(forced_action)
@@ -166,3 +177,17 @@ class PolicyGradientAgent:
     def _decay_epsilon(self) -> None:
         self.episodes_trained += 1
         self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+
+    def _central_opening_pool(
+        self,
+        valid_actions: list[tuple[int, int]],
+        board_size: int,
+    ) -> list[tuple[int, int]]:
+        opening_span = min(10, board_size)
+        opening_offset = (board_size - opening_span) // 2
+        opening_limit = opening_offset + opening_span - 1
+        return [
+            action
+            for action in valid_actions
+            if opening_offset <= action[0] <= opening_limit and opening_offset <= action[1] <= opening_limit
+        ]

@@ -124,17 +124,6 @@ class TorchHybridAgent:
             raise ValueError("no valid actions available")
 
         board_tensor = self._board_tensor(env)
-        forced_action = find_forced_action(env)
-        if forced_action is not None:
-            chosen_action_index = valid_actions.index(forced_action)
-            policy_log_prob = self._policy_log_prob_for_action(env, forced_action, valid_actions)
-            return forced_action, TorchHybridStepRecord(
-                board_tensor,
-                chosen_action_index,
-                policy_log_prob,
-                selection_reason="forced",
-            )
-
         if training and env.move_count == 0:
             opening_pool = self._central_opening_pool(valid_actions, env.board_size)
             chosen_action = self.random.choice(opening_pool)
@@ -145,6 +134,17 @@ class TorchHybridAgent:
                 chosen_action_index,
                 policy_log_prob,
                 selection_reason="opening_random",
+            )
+
+        forced_action = find_forced_action(env)
+        if forced_action is not None:
+            chosen_action_index = valid_actions.index(forced_action)
+            policy_log_prob = self._policy_log_prob_for_action(env, forced_action, valid_actions)
+            return forced_action, TorchHybridStepRecord(
+                board_tensor,
+                chosen_action_index,
+                policy_log_prob,
+                selection_reason="forced",
             )
 
         value_scores = self._action_value_scores(env, valid_actions)
